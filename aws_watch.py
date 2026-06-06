@@ -338,7 +338,6 @@ def cpu_via_cloudwatch(session, region, instance_id):
     """Average CPUUtilization (%) over the last hour, or None."""
     cw = session.client("cloudwatch", region_name=region)
     end = now_utc()
-    start = end.replace(microsecond=0)
     start = datetime.fromtimestamp(end.timestamp() - 3600, tz=timezone.utc)
     try:
         resp = cw.get_metric_statistics(
