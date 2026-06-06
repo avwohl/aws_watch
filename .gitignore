@@ -1,0 +1,33 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Project planning notes (contain credentials in this working copy)
+todo.txt
+todo.txt~
+*.txt~
+
+# Live, user-specific config (ship config.example.yaml instead)
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Runtime state / logs
+*.log
+state/
+*.state.json
+
+# OS / editor
+.DS_Store
+*.swp
+*~

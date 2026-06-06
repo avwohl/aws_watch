@@ -1,0 +1,54 @@
+# aws_watch configuration.
+#
+# Copy this file to config.yaml and edit.  config.yaml is git-ignored so your
+# settings (and the suppress list) stay out of the repository.
+#
+# AWS credentials do NOT go here -- they live in .env (also git-ignored).
+
+email:
+  to: you@example.com               # where reports/alerts are sent
+  from: null                        # null => aws_watch@<this-host-fqdn>
+  subject_prefix: "[aws_watch]"
+  method: sendmail                  # "sendmail" (local MTA) or "smtp"
+  sendmail_path: /usr/sbin/sendmail
+  smtp:                             # only used when method: smtp
+    host: localhost
+    port: 25
+    use_tls: false
+    username: null
+    password: null
+
+# Which regions to scan.  "all" = every enabled region.  Or list explicitly:
+#   regions: [us-east-1, us-east-2]
+regions: all
+
+digest:
+  hour: 8                           # local hour (0-23) to send the daily full inventory
+
+# Re-send an alert about the *same* resource at most this often (hours).
+# Prevents an idle box from e-mailing you every single hour.
+renotify_hours: 24
+
+alerts:
+  idle_instances:
+    enabled: true
+    min_age_minutes: 30             # ignore boxes launched within this window (still booting)
+    load_per_vcpu: 0.10             # 5-min load average / vCPU below this => idle
+    cpu_percent: 5.0                # CloudWatch CPU% fallback (when load avg unavailable)
+  unattached_volumes:
+    enabled: true                   # EBS volumes in 'available' (detached) state
+  unassociated_eips:
+    enabled: true                   # Elastic IPs not associated with anything (billed)
+  old_instances:
+    enabled: true
+    max_age_hours: 24               # flag on-demand instances running longer than this
+    include_spot: false             # also flag long-running spot instances?
+
+# Resources to exclude from ALERTS when you intend to run them long-term.
+# They still appear in the inventory, marked "(suppressed)".
+# Entries may be a resource id, or "name:<glob>" to match an instance Name tag.
+suppress: []
+#  - i-0123456789abcdef0
+#  - vol-0123456789abcdef0
+#  - eipalloc-0123456789abcdef0
+#  - "name:build-farm-*"
