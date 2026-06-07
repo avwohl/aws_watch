@@ -47,8 +47,75 @@ alerts:
 # Resources to exclude from ALERTS when you intend to run them long-term.
 # They still appear in the inventory, marked "(suppressed)".
 # Entries may be a resource id, or "name:<glob>" to match an instance Name tag.
+# NOTE: suppressed resources are ALSO never reaped (see the reaper below).
 suppress: []
 #  - i-0123456789abcdef0
 #  - vol-0123456789abcdef0
 #  - eipalloc-0123456789abcdef0
 #  - "name:build-farm-*"
+
+# ===========================================================================
+# Reaper -- *** DESTRUCTIVE ***  TERMINATES EC2 INSTANCES.
+# ===========================================================================
+# This is the ONLY part of aws_watch that deletes anything.  It exists to clean
+# up *temporary* boxes that a build/automation left running, while never
+# touching production.  It is OFF by default and runs as a separate `reap`
+# command (the hourly watcher never terminates anything).
+#
+# READ THIS BEFORE ENABLING:
+#   * An instance is terminated ONLY when ALL of these hold:
+#       1. enabled: true
+#       2. its Name (or Project) tag matches one of `name_prefixes`  <-- allowlist
+#       3. it matches NO protect_* rule, has no protect tag, is not suppressed
+#       4. it is older than `min_age_minutes`
+#       5. it is idle, OR older than `max_age_hours`
+#   * With an EMPTY `name_prefixes`, nothing is ever a candidate -- the reaper
+#     is a no-op.  The allowlist is the primary safety gate: name it narrowly.
+#   * Even fully configured, `aws_watch.py reap` only PREVIEWS.  Termination
+#     happens only with `aws_watch.py reap --apply`.
+#   * Reaping needs extra IAM permissions (ec2:TerminateInstances,
+#     cloudwatch:DeleteAlarms) beyond the read-only watcher policy.  Use a
+#     separate, scoped credential if you can.
+#   * Always run `aws_watch.py reap` (preview) after any change and read the
+#     KEPT/REAP tables before trusting `--apply` in cron.
+reap:
+  enabled: false                    # MASTER SWITCH. false => never terminates.
+
+  # ALLOWLIST (required).  Globs matched against the tag keys in match_tag_keys.
+  # ONLY instances matching one of these can ever be reaped.  Empty => no-op.
+  #   * Matching is CASE-SENSITIVE: "Iospharo-*" will NOT match "iospharo-build".
+  #   * NEVER use a bare "*" (or "*-*") here -- that matches everything and makes
+  #     the allowlist meaningless; the reaper warns loudly if you do.
+  #   * Always run `aws_watch.py reap` (preview) after editing this list.
+  name_prefixes: []
+  #  - "iospharo-*"                  # e.g. ephemeral build boxes
+  match_tag_keys: [Name, Project]   # tag keys the prefixes are tested against
+                                    # (explicit [] => match no keys => reaps nothing)
+
+  # Regions to sweep.  [] => use the top-level `regions` setting above.  For a
+  # destructive sweep, listing regions explicitly (not "all") is safer.
+  regions: []
+  #  - us-east-2
+
+  min_age_minutes: 30               # grace: never touch a box younger than this
+  max_age_hours: 12                 # hard cap: reap at this age regardless of load
+                                    # (null => disable age-based reaping; idle only)
+  idle:
+    enabled: true
+    load_per_vcpu: 0.10             # 5-min load / vCPU below this => idle
+    cpu_percent: 5.0                # CloudWatch CPU% fallback below this => idle
+
+  # NEVER-REAP rules.  Any single match spares the instance even if it matched a
+  # prefix and looks idle/old.  Belt and suspenders -- use them generously.
+  protect_ids: []                   #  - i-0123456789abcdef0
+  protect_name_globs: []            #  - "*-prod-*"
+  protect_regions: []               #  - us-west-2
+  protect_zones: []                 #  - us-east-2c
+  protect_tag: "Reap=skip"          # key=value tag that exempts a box. "Reap"
+                                    # (no =value) exempts on key presence. "" disables.
+
+  # After terminating, optionally delete a per-instance CloudWatch alarm.
+  # "{id}" is replaced with the instance id.  null => leave alarms alone.
+  delete_alarm_template: null       # e.g. "iospharo-idle-terminate-{id}"
+
+  email_on_reap: true               # e-mail a summary whenever boxes are terminated

@@ -97,6 +97,35 @@ CONFIG_DEFAULTS = {
         },
     },
     "suppress": [],                         # resource ids or "name:<glob>" excluded from alerts
+    # --- Reaper (DESTRUCTIVE): terminate orphaned temporary instances. ------- #
+    # OFF by default.  Read the README warnings before enabling.  An instance is
+    # terminated only when ALL of these hold:
+    #   1. reap.enabled is true              4. it is older than min_age_minutes
+    #   2. its Name/Project tag matches      5. it is idle, OR older than
+    #      one of reap.name_prefixes            max_age_hours
+    #   3. it matches NO protect_* rule, carries no protect tag, is not suppressed
+    # ...and even then nothing dies unless invoked as `reap --apply`; a bare
+    # `reap` only reports what it WOULD do.
+    "reap": {
+        "enabled": False,                   # master switch; false => never terminates
+        "name_prefixes": [],                # REQUIRED allowlist of globs; [] => nothing
+        "match_tag_keys": ["Name", "Project"],  # tag keys the prefixes match against
+        "regions": [],                      # regions to sweep; [] => top-level `regions`
+        "min_age_minutes": 30,              # grace: never touch boxes younger than this
+        "max_age_hours": 12,                # hard cap: reap at this age (null => age off)
+        "idle": {
+            "enabled": True,
+            "load_per_vcpu": 0.10,          # 5-min load / vCPU below this => idle
+            "cpu_percent": 5.0,             # CloudWatch CPU% fallback below this => idle
+        },
+        "protect_ids": [],                  # never reap these instance ids
+        "protect_name_globs": [],           # never reap names matching these globs
+        "protect_regions": [],              # never reap anything in these regions
+        "protect_zones": [],                # never reap anything in these AZs
+        "protect_tag": "Reap=skip",         # key=value tag that exempts a box ("" => off)
+        "delete_alarm_template": None,      # e.g. "iospharo-idle-terminate-{id}" (null => none)
+        "email_on_reap": True,              # e-mail a summary when boxes are terminated
+    },
 }
 
 
@@ -376,6 +405,8 @@ def collect_region(session, region, cfg, vcpu_cache, lock):
                     instances.append({
                         "id": inst["InstanceId"],
                         "name": _name_tag(inst.get("Tags")),
+                        "tags": {t.get("Key"): t.get("Value")
+                                 for t in (inst.get("Tags") or []) if t.get("Key")},
                         "type": inst.get("InstanceType"),
                         "arch": inst.get("Architecture"),
                         "lifecycle": inst.get("InstanceLifecycle", "on-demand"),
@@ -500,6 +531,29 @@ def instance_load5_per_vcpu(inst):
     return None
 
 
+def idle_reason(inst, idle_cfg):
+    """Human reason string if the instance looks idle, else None.
+
+    Prefers the true 5-min load average (via SSM) and falls back to CloudWatch
+    CPU%.  Returns None when *no* metric is available -- we never call a box idle
+    on missing data, which keeps both alerting and reaping conservative.
+    """
+    # .get() with the built-in defaults so a partial/None idle config (e.g.
+    # reap.idle: null in yaml, which deep_merge turns into {}) never crashes.
+    load_thr = idle_cfg.get("load_per_vcpu", 0.10)
+    cpu_thr = idle_cfg.get("cpu_percent", 5.0)
+    per = instance_load5_per_vcpu(inst)
+    if per is not None:
+        if per < load_thr:
+            return "load5/vCPU %.2f < %.2f (load %.2f on %s vCPU, %s)" % (
+                per, load_thr, inst["load"]["load5"], inst["vcpus"], inst["type"])
+        return None
+    if inst.get("cpu") is not None and inst["cpu"] < cpu_thr:
+        return "CPU %.1f%% < %.1f%% over last hour (%s)" % (
+            inst["cpu"], cpu_thr, inst["type"])
+    return None
+
+
 def compute_alerts(inventory, cfg) -> list:
     alerts = []
     acfg = cfg["alerts"]
@@ -516,21 +570,12 @@ def compute_alerts(inventory, cfg) -> list:
 
         # idle detection
         if idle.get("enabled") and age is not None and age >= idle["min_age_minutes"] * 60:
-            per = instance_load5_per_vcpu(inst)
-            if per is not None and per < idle["load_per_vcpu"]:
+            reason = idle_reason(inst, idle)
+            if reason:
                 alerts.append({
                     "type": "idle_instance", "severity": "HIGH",
                     "resource_id": inst["id"], "name": inst["name"], "region": inst["region"],
-                    "reason": "load5/vCPU %.2f < %.2f (load %.2f on %s vCPU, %s)" % (
-                        per, idle["load_per_vcpu"], inst["load"]["load5"],
-                        inst["vcpus"], inst["type"]),
-                })
-            elif per is None and inst.get("cpu") is not None and inst["cpu"] < idle["cpu_percent"]:
-                alerts.append({
-                    "type": "idle_instance", "severity": "HIGH",
-                    "resource_id": inst["id"], "name": inst["name"], "region": inst["region"],
-                    "reason": "CPU %.1f%% < %.1f%% over last hour (%s)" % (
-                        inst["cpu"], idle["cpu_percent"], inst["type"]),
+                    "reason": reason,
                 })
 
         # old long-running instance
@@ -564,6 +609,167 @@ def compute_alerts(inventory, cfg) -> list:
 
     alerts.sort(key=lambda a: (SEVERITY_ORDER.get(a["severity"], 9), a["region"], a["resource_id"]))
     return alerts
+
+
+# --------------------------------------------------------------------------- #
+# Reaper (DESTRUCTIVE) -- terminate orphaned temporary instances.             #
+#                                                                             #
+# This is the only part of aws_watch that deletes anything, and it is OFF by  #
+# default.  Safety is layered (see reap_evaluate): a box is reaped only if it #
+# matches the name_prefixes allowlist AND no protect rule AND is not          #
+# suppressed AND is past the grace age AND is idle-or-too-old.  The pure      #
+# decision logic below makes no AWS calls and is exercised by the unit tests. #
+# --------------------------------------------------------------------------- #
+
+def _matches_any_glob(value, globs) -> bool:
+    return bool(value) and any(fnmatch.fnmatch(value, g) for g in (globs or []))
+
+
+def _reap_match_value(inst, key) -> str:
+    """Value used for prefix matching: 'Name' comes from the name field, any
+    other key from the collected tag map."""
+    if key == "Name":
+        return inst.get("name") or ""
+    return (inst.get("tags") or {}).get(key) or ""
+
+
+def reap_candidate_match(inst, rcfg):
+    """First (tag_key, value) that matches a reap prefix, else (None, None).
+
+    This is the allowlist gate.  With an empty name_prefixes nothing matches, so
+    nothing is ever a reap candidate -- the safe default.
+    """
+    prefixes = rcfg.get("name_prefixes") or []
+    if not prefixes:
+        return None, None
+    # Only None means "unset -> use defaults"; an explicit [] means "match no
+    # tag keys" (so nothing is a candidate) -- fail closed, never fall back.
+    keys = rcfg.get("match_tag_keys")
+    if keys is None:
+        keys = ["Name", "Project"]
+    for key in keys:
+        val = _reap_match_value(inst, key)
+        if _matches_any_glob(val, prefixes):
+            return key, val
+    return None, None
+
+
+def reap_protected_by(inst, rcfg, cfg):
+    """Name of the protection that spares *inst* from reaping, or None.
+
+    Any single match here vetoes a reap, even when the instance matched a reap
+    prefix and looks idle/old.  The global `suppress` list protects too, so
+    anything you have told aws_watch to never alert about is also never reaped.
+    """
+    if inst["id"] in (rcfg.get("protect_ids") or []):
+        return "protect_ids"
+    if _matches_any_glob(inst.get("name"), rcfg.get("protect_name_globs")):
+        return "protect_name_globs"
+    if inst.get("region") in (rcfg.get("protect_regions") or []):
+        return "protect_regions"
+    if inst.get("az") in (rcfg.get("protect_zones") or []):
+        return "protect_zones"
+    tag = rcfg.get("protect_tag") or ""
+    if tag:
+        key, sep, val = tag.partition("=")
+        key, val = key.strip(), val.strip()
+        if key:
+            have = (inst.get("tags") or {}).get(key)
+            # "Reap=skip" => key present with that value; "Reap" => key present, any value.
+            if have is not None and (not sep or val == "" or have == val):
+                return "protect_tag(%s)" % tag
+    if is_suppressed(inst["id"], inst.get("name"), cfg):
+        return "suppress"
+    return None
+
+
+def reap_evaluate(inst, cfg, ref=None) -> dict:
+    """Decide one instance's fate.  Pure: no AWS calls, no side effects.
+
+    Returns {"action": "reap"|"keep"|"skip", "reason": str, "match": str|None}.
+    'skip' means the instance is not even a reap candidate (no prefix match) and
+    is reported quietly; 'keep' means it matched a prefix but was spared.
+    """
+    rcfg = cfg["reap"]
+    if inst.get("state") != "running":
+        return {"action": "skip", "reason": "not running", "match": None}
+    key, val = reap_candidate_match(inst, rcfg)
+    if not key:
+        return {"action": "skip", "reason": "no reap-prefix match", "match": None}
+    match = "%s=%s" % (key, val)
+
+    prot = reap_protected_by(inst, rcfg, cfg)
+    if prot:
+        return {"action": "keep", "reason": "protected: %s" % prot, "match": match}
+
+    age = age_seconds(inst.get("launch"), ref)
+    if age is None:
+        # Cannot determine age -> never reap (be conservative on missing data).
+        return {"action": "keep", "reason": "unknown launch time", "match": match}
+    grace = rcfg.get("min_age_minutes") or 0
+    if age < grace * 60:
+        return {"action": "keep",
+                "reason": "age %s < grace %dm" % (fmt_age(age), grace), "match": match}
+
+    max_age_h = rcfg.get("max_age_hours")
+    if max_age_h is not None and age >= max_age_h * 3600:
+        return {"action": "reap",
+                "reason": "age %s >= max %dh" % (fmt_age(age), max_age_h), "match": match}
+
+    idle_cfg = rcfg.get("idle") or {}
+    if idle_cfg.get("enabled", True):
+        reason = idle_reason(inst, idle_cfg)
+        if reason:
+            return {"action": "reap", "reason": "idle: %s" % reason, "match": match}
+
+    return {"action": "keep", "reason": "active (age %s)" % fmt_age(age), "match": match}
+
+
+def reap_report(decisions) -> str:
+    """Tab-separated report of reap decisions (no line-drawing; e-mail safe)."""
+    ref = now_utc()
+
+    def row(d, with_outcome):
+        i = d["inst"]
+        cells = [i["region"], i["id"], (i["name"] or "-"), i["type"],
+                 fmt_age(age_seconds(i["launch"], ref)), d.get("match") or "-"]
+        if with_outcome:
+            cells.append(d.get("outcome", "would-reap"))
+        cells.append(d["reason"])
+        return cells
+
+    reap_rows = [row(d, True) for d in decisions if d["action"] == "reap"]
+    keep_rows = [row(d, False) for d in decisions if d["action"] == "keep"]
+    chunks = [
+        _section("REAP", ["region", "id", "name", "type", "age", "matched",
+                          "outcome", "reason"], reap_rows),
+        _section("KEPT (matched a reap prefix but spared)",
+                 ["region", "id", "name", "type", "age", "matched", "reason"], keep_rows),
+    ]
+    return "\n\n".join(chunks)
+
+
+def reap_preflight_warnings(rcfg, regions) -> list:
+    """Risky-configuration warnings for a destructive sweep (logged + shown).
+
+    These catch the cases where the safety gates are technically satisfied but
+    the intent is dangerous: a prefix that matches everything, or an accidental
+    all-region sweep.  They do not block -- the preview/`--apply` split does that
+    -- but they make the danger impossible to miss.
+    """
+    warnings = []
+    for p in rcfg.get("name_prefixes") or []:
+        literal = "".join(c for c in (p or "") if c not in "*?[]").strip()
+        if not literal:
+            warnings.append(
+                "name_prefix %r is a bare wildcard -- it matches EVERY instance, "
+                "so only protect rules / suppress would save production. Use a "
+                "narrow, literal prefix." % p)
+    if len(regions) > 5:
+        warnings.append(
+            "this sweep covers %d regions (reap.regions is unset or 'all'); for a "
+            "destructive sweep, prefer an explicit, short reap.regions list." % len(regions))
+    return warnings
 
 
 # --------------------------------------------------------------------------- #
@@ -820,6 +1026,114 @@ def run(cfg, session, state_path, *, force_digest=False, dry_run=False, no_email
     return inventory, alerts, action
 
 
+def _terminate_instance(session, inst, rcfg) -> bool:
+    """Terminate one instance and best-effort delete its idle alarm.  Returns
+    True on a successful terminate call."""
+    region = inst["region"]
+    try:
+        ec2 = session.client("ec2", region_name=region)
+        ec2.terminate_instances(InstanceIds=[inst["id"]])
+        log.warning("REAPED %s (%s) [%s]", inst["id"], inst["name"] or "-", region)
+    except Exception as exc:  # noqa: BLE001 - report and keep going
+        log.error("FAILED to terminate %s (%s) [%s]: %s",
+                  inst["id"], inst["name"] or "-", region, exc)
+        return False
+    tmpl = rcfg.get("delete_alarm_template")
+    if tmpl:
+        try:
+            cw = session.client("cloudwatch", region_name=region)
+            cw.delete_alarms(AlarmNames=[tmpl.format(id=inst["id"])])
+        except Exception as exc:  # noqa: BLE001 - alarm cleanup is non-critical
+            log.debug("alarm delete failed for %s: %s", inst["id"], exc)
+    return True
+
+
+def reap(cfg, session, *, apply=False, no_email=False):
+    """Sweep configured regions and reap orphaned temporary instances.
+
+    With apply=False (the default) nothing is terminated -- it only reports what
+    it WOULD do.  Actually terminating additionally requires reap.enabled and a
+    non-empty name_prefixes allowlist; both are refused (logged) otherwise, so a
+    misconfigured or default install can never delete anything.
+    """
+    rcfg = cfg["reap"]
+    account = get_account_id(session)
+
+    # Region scope: explicit reap.regions, else fall back to the top-level scan.
+    rr = rcfg.get("regions")
+    if not rr:
+        regions = get_regions(session, cfg)
+    elif rr == "all":
+        regions = get_regions(session, {"regions": "all"})
+    else:
+        regions = list(rr)
+
+    will_terminate = apply
+    if apply and not rcfg.get("enabled"):
+        log.error("reap --apply refused: reap.enabled is false in config "
+                  "(running as dry-run instead)")
+        will_terminate = False
+    if apply and not (rcfg.get("name_prefixes")):
+        log.error("reap --apply refused: reap.name_prefixes is empty -- an empty "
+                  "allowlist is ambiguous and would be unsafe (dry-run instead)")
+        will_terminate = False
+
+    log.info("reap sweep: %d region(s), account %s, mode=%s",
+             len(regions), account, "APPLY (terminating)" if will_terminate else "dry-run")
+
+    warnings = reap_preflight_warnings(rcfg, regions)
+    for w in warnings:
+        log.warning("reap: %s", w)
+
+    inventory = collect_all(session, cfg, regions)
+    ref = now_utc()
+    decisions = []
+    for inst in inventory["instances"]:
+        # One malformed instance must never abort a destructive sweep: on any
+        # error we log it and keep the box (fail safe -- it is not terminated).
+        try:
+            d = reap_evaluate(inst, cfg, ref)
+        except Exception as exc:  # noqa: BLE001
+            log.error("reap: error evaluating %s [%s]: %s -- keeping it",
+                      inst.get("id"), inst.get("region"), exc)
+            d = {"action": "skip", "reason": "evaluation error (kept)", "match": None}
+        d["inst"] = inst
+        decisions.append(d)
+
+    to_reap = [d for d in decisions if d["action"] == "reap"]
+    kept = [d for d in decisions if d["action"] == "keep"]
+
+    for d in to_reap:
+        if will_terminate:
+            d["outcome"] = "reaped" if _terminate_instance(session, d["inst"], rcfg) else "FAILED"
+        else:
+            d["outcome"] = "would-reap"
+
+    reaped = [d for d in to_reap if d.get("outcome") == "reaped"]
+    summary = "reap: %d %s, %d kept (%d candidate%s matched a prefix), account %s | %s" % (
+        len(reaped) if will_terminate else len(to_reap),
+        "reaped" if will_terminate else "would-reap",
+        len(kept), len(to_reap) + len(kept), "" if len(to_reap) + len(kept) == 1 else "s",
+        account, now_utc().strftime("%Y-%m-%d %H:%M UTC"))
+
+    report = reap_report(decisions)
+    if warnings:
+        print("!!! REAP CONFIG WARNINGS:")
+        for w in warnings:
+            print("!!!   " + w)
+        print()
+    print(summary)
+    print()
+    print(report)
+    log.info(summary)
+
+    if will_terminate and reaped and rcfg.get("email_on_reap") and not no_email:
+        body = "%s\n\n%s\n" % (summary, report)
+        send_email(cfg, "reaped %d instance(s) (acct %s)" % (len(reaped), account), body)
+
+    return decisions
+
+
 # --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
@@ -844,15 +1158,20 @@ def setup_logging(verbose, log_path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Watch AWS for idle / wasteful resources.")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "report", "digest", "test-email"],
+                        choices=["run", "report", "digest", "test-email", "reap"],
                         help="run: hourly logic; report: print full inventory; "
-                             "digest: force a digest now; test-email: send a test message")
+                             "digest: force a digest now; test-email: send a test message; "
+                             "reap: terminate orphaned temp instances (DESTRUCTIVE -- "
+                             "preview only unless --apply)")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--env", default=DEFAULT_ENV)
     parser.add_argument("--state", default=DEFAULT_STATE)
     parser.add_argument("--regions", help="comma-separated region override")
     parser.add_argument("--dry-run", action="store_true", help="never send e-mail; print instead")
     parser.add_argument("--no-email", action="store_true", help="alias for --dry-run output")
+    parser.add_argument("--apply", action="store_true",
+                        help="reap: actually terminate instances (default is a dry-run "
+                             "preview); also needs reap.enabled + reap.name_prefixes in config")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -875,6 +1194,11 @@ def main(argv=None):
         inventory = collect_all(session, cfg, regions)
         alerts = compute_alerts(inventory, cfg)
         print(build_body(inventory, alerts, cfg, account, "report"))
+        return 0
+
+    if args.command == "reap":
+        # --dry-run always wins over --apply, so it is a hard "preview only" override.
+        reap(cfg, session, apply=args.apply and not args.dry_run, no_email=args.no_email)
         return 0
 
     force_digest = args.command == "digest"

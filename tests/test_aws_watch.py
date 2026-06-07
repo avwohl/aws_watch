@@ -12,10 +12,12 @@ import aws_watch as aw  # noqa: E402
 def inst(**kw):
     base = dict(id="i-1", name="", type="c7g.4xlarge", arch="arm64",
                 lifecycle="on-demand", state="running", az="us-east-2a",
-                public_ip=None, private_ip=None, region="us-east-2",
+                public_ip=None, private_ip=None, region="us-east-2", tags=None,
                 load=None, cpu=None, vcpus=16, metric_src=None,
                 launch=aw.now_utc() - timedelta(hours=2))
     base.update(kw)
+    if base.get("tags") is None:
+        base["tags"] = {"Name": base["name"]} if base["name"] else {}
     return base
 
 
@@ -123,6 +125,166 @@ class TestFormatting(unittest.TestCase):
         for ch in self.BOX_CHARS:
             self.assertNotIn(ch, body, "line-drawing char %r leaked into report" % ch)
         self.assertIn("\t", body)  # columns are tab-separated
+
+
+class TestReaper(unittest.TestCase):
+    """The reaper TERMINATES instances -- these tests pin down exactly which
+    ones it will and (more importantly) will NOT touch.  Pure logic, no AWS."""
+
+    def cfg(self, **reap):
+        base = {"enabled": True, "name_prefixes": ["iospharo-*"]}
+        base.update(reap)
+        return aw.deep_merge(aw.CONFIG_DEFAULTS, {"reap": base})
+
+    def act(self, inst, cfg=None):
+        return aw.reap_evaluate(inst, cfg or self.cfg())["action"]
+
+    # --- the allowlist gate -------------------------------------------------
+    def test_name_prefix_match_idle_is_reaped(self):
+        i = inst(name="iospharo-build-1", cpu=1.0)
+        self.assertEqual(self.act(i), "reap")
+
+    def test_project_tag_prefix_match(self):
+        i = inst(name="x64-builder", tags={"Name": "x64-builder", "Project": "iospharo-x64"}, cpu=1.0)
+        self.assertEqual(self.act(i), "reap")
+
+    def test_non_candidate_is_skipped(self):
+        # A box that matches no reap prefix is never even a candidate ...
+        self.assertEqual(self.act(inst(name="prod-db")), "skip")
+
+    def test_non_candidate_idle_is_never_reaped(self):
+        # ... not even when it is bone idle.  This is THE safety property.
+        i = inst(name="prod-db", cpu=0.0,
+                 load={"load1": 0.0, "load5": 0.0, "load15": 0.0, "nproc": 16})
+        self.assertEqual(self.act(i), "skip")
+
+    def test_empty_allowlist_reaps_nothing(self):
+        # No name_prefixes => nothing matches => nothing is a candidate.
+        cfg = self.cfg(name_prefixes=[])
+        self.assertEqual(self.act(inst(name="iospharo-build", cpu=0.0), cfg), "skip")
+
+    # --- reasons to reap ----------------------------------------------------
+    def test_idle_candidate_reaped(self):
+        i = inst(name="iospharo-x", load={"load1": 0.0, "load5": 0.1, "load15": 0.0, "nproc": 16})
+        self.assertEqual(self.act(i), "reap")
+
+    def test_old_busy_candidate_reaped_on_age(self):
+        i = inst(name="iospharo-x", launch=aw.now_utc() - timedelta(hours=20),
+                 load={"load1": 14.0, "load5": 15.0, "load15": 13.0, "nproc": 16})
+        self.assertEqual(self.act(i), "reap")
+
+    def test_age_reaping_can_be_disabled(self):
+        i = inst(name="iospharo-x", launch=aw.now_utc() - timedelta(hours=20),
+                 load={"load1": 14.0, "load5": 15.0, "load15": 13.0, "nproc": 16})
+        self.assertEqual(self.act(i, self.cfg(max_age_hours=None)), "keep")
+
+    # --- reasons to keep a candidate ---------------------------------------
+    def test_busy_candidate_kept(self):
+        i = inst(name="iospharo-x", load={"load1": 14.0, "load5": 15.0, "load15": 13.0, "nproc": 16})
+        self.assertEqual(self.act(i), "keep")
+
+    def test_grace_keeps_young_candidate(self):
+        i = inst(name="iospharo-x", cpu=0.0, launch=aw.now_utc() - timedelta(minutes=5))
+        self.assertEqual(self.act(i), "keep")
+
+    def test_unknown_age_kept(self):
+        i = inst(name="iospharo-x", cpu=0.0, launch=None)
+        self.assertEqual(self.act(i), "keep")
+
+    def test_not_running_skipped(self):
+        i = inst(name="iospharo-x", state="stopped", cpu=0.0)
+        self.assertEqual(self.act(i), "skip")
+
+    def test_no_metric_idle_not_reaped(self):
+        # No load and no CPU datapoint => cannot conclude idle => kept.
+        i = inst(name="iospharo-x", load=None, cpu=None)
+        self.assertEqual(self.act(i), "keep")
+
+    # --- protections veto a reap -------------------------------------------
+    def test_protect_id(self):
+        i = inst(name="iospharo-x", id="i-keep", cpu=0.0)
+        self.assertEqual(self.act(i, self.cfg(protect_ids=["i-keep"])), "keep")
+
+    def test_protect_name_glob(self):
+        i = inst(name="iospharo-prod-1", cpu=0.0)
+        self.assertEqual(self.act(i, self.cfg(protect_name_globs=["*-prod-*"])), "keep")
+
+    def test_protect_region(self):
+        i = inst(name="iospharo-x", region="us-west-2", cpu=0.0)
+        self.assertEqual(self.act(i, self.cfg(protect_regions=["us-west-2"])), "keep")
+
+    def test_protect_zone(self):
+        i = inst(name="iospharo-x", az="us-east-2c", cpu=0.0)
+        self.assertEqual(self.act(i, self.cfg(protect_zones=["us-east-2c"])), "keep")
+
+    def test_protect_tag_value(self):
+        i = inst(name="iospharo-x", tags={"Name": "iospharo-x", "Reap": "skip"}, cpu=0.0)
+        self.assertEqual(self.act(i), "keep")  # default protect_tag is "Reap=skip"
+
+    def test_protect_tag_wrong_value_not_protected(self):
+        i = inst(name="iospharo-x", tags={"Name": "iospharo-x", "Reap": "yes"}, cpu=0.0)
+        self.assertEqual(self.act(i), "reap")
+
+    def test_protect_tag_key_only(self):
+        # protect_tag "Reap" (no =value) protects on key presence, any value.
+        i = inst(name="iospharo-x", tags={"Name": "iospharo-x", "Reap": "whatever"}, cpu=0.0)
+        self.assertEqual(self.act(i, self.cfg(protect_tag="Reap")), "keep")
+
+    def test_suppress_list_protects(self):
+        cfg = self.cfg()
+        cfg["suppress"] = ["i-1"]
+        i = inst(name="iospharo-x", cpu=0.0)
+        self.assertEqual(aw.reap_evaluate(i, cfg)["action"], "keep")
+
+    def test_suppress_name_glob_protects(self):
+        cfg = self.cfg()
+        cfg["suppress"] = ["name:iospharo-keep-*"]
+        i = inst(name="iospharo-keep-7", cpu=0.0)
+        self.assertEqual(aw.reap_evaluate(i, cfg)["action"], "keep")
+
+    # --- robustness / fail-safe (from the safety review) -------------------
+    def test_partial_idle_config_does_not_crash(self):
+        # reap.idle: null (=> {}) must not KeyError; falls back to defaults.
+        cfg = self.cfg(idle=None)
+        i = inst(name="iospharo-x", cpu=1.0)
+        self.assertEqual(aw.reap_evaluate(i, cfg)["action"], "reap")
+        cfg2 = self.cfg(idle={"enabled": True})  # missing thresholds
+        self.assertEqual(aw.reap_evaluate(inst(name="iospharo-x", cpu=1.0), cfg2)["action"], "reap")
+
+    def test_empty_match_tag_keys_reaps_nothing(self):
+        # Explicit [] means "match no keys" => fail closed (never a candidate).
+        cfg = self.cfg(match_tag_keys=[])
+        self.assertEqual(self.act(inst(name="iospharo-x", cpu=0.0), cfg), "skip")
+
+    def test_idle_reason_robust_to_empty_cfg(self):
+        i = inst(name="x", cpu=1.0)
+        self.assertIsNotNone(aw.idle_reason(i, {}))          # uses defaults, no crash
+        self.assertIsNone(aw.idle_reason(inst(cpu=99.0), {}))
+
+    def test_preflight_warns_on_bare_wildcard(self):
+        warns = aw.reap_preflight_warnings({"name_prefixes": ["*"]}, ["us-east-2"])
+        self.assertTrue(any("wildcard" in w for w in warns))
+        warns = aw.reap_preflight_warnings({"name_prefixes": ["**"]}, ["us-east-2"])
+        self.assertTrue(warns)
+
+    def test_preflight_no_warn_on_narrow_prefix(self):
+        self.assertEqual(
+            aw.reap_preflight_warnings({"name_prefixes": ["iospharo-*"]}, ["us-east-2"]), [])
+
+    def test_preflight_warns_on_many_regions(self):
+        many = ["r%d" % n for n in range(12)]
+        warns = aw.reap_preflight_warnings({"name_prefixes": ["iospharo-*"]}, many)
+        self.assertTrue(any("region" in w for w in warns))
+
+    # --- report is e-mail safe ---------------------------------------------
+    def test_reap_report_no_line_drawing(self):
+        d = aw.reap_evaluate(inst(name="iospharo-x", cpu=0.0), self.cfg())
+        d["inst"] = inst(name="iospharo-x", cpu=0.0)
+        d["outcome"] = "would-reap"
+        body = aw.reap_report([d])
+        for ch in "─│┌┐└┘├┤┬┴┼":
+            self.assertNotIn(ch, body)
+        self.assertIn("\t", body)
 
 
 if __name__ == "__main__":
