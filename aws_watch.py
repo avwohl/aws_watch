@@ -125,6 +125,29 @@ CONFIG_DEFAULTS = {
         "protect_tag": "Reap=skip",         # key=value tag that exempts a box ("" => off)
         "delete_alarm_template": None,      # e.g. "iospharo-idle-terminate-{id}" (null => none)
         "email_on_reap": True,              # e-mail a summary when boxes are terminated
+        # --- Keep-alive leases (see README "Keep-alive leases") ---------------- #
+        # A box with a FRESH lease in the instance_lease table is spared from
+        # *idle* reaping; a stale/absent lease lets the normal idle/age rules act.
+        # Only an actively-working process heartbeats the lease (for iospharo, a
+        # running Claude via a tool-use hook), so an abandoned box's lease goes
+        # stale within stale_after_minutes and it is reaped like any other orphan.
+        # This REPLACES per-box "never reap me" tags: nothing stays exempt forever.
+        "keepalive": {
+            "enabled": True,                # false => leases ignored entirely
+            "stale_after_minutes": 30,      # heartbeat older than this => not protected
+            "overrides_max_age": False,     # false => the max_age_hours hard cap still wins
+            "on_db_error": "keep",          # "keep": fail-safe, spare all | "ignore": reap per normal rules
+            "db": {                         # MariaDB connection (unix_socket auth by default)
+                "unix_socket": "/run/mysqld/mysqld.sock",
+                "host": None,
+                "port": 3306,
+                "user": None,               # null => the invoking OS user
+                "password": None,
+                "database": "aws_watch",
+                "table": "instance_lease",
+                "read_default_file": None,
+            },
+        },
     },
 }
 
@@ -683,12 +706,28 @@ def reap_protected_by(inst, rcfg, cfg):
     return None
 
 
-def reap_evaluate(inst, cfg, ref=None) -> dict:
+def lease_fresh_ids(kcfg):
+    """Set of instance_ids that currently hold a LIVE keep-alive lease.
+
+    Lazy-imports the lease_db helper so aws_watch still runs anywhere keepalive
+    is off (or pymysql / the module is absent).  Raises on any DB error -- the
+    caller turns that into the configured fail-safe (keep) or fail-open (ignore).
+    """
+    import lease_db   # local module, same directory as this script
+    return lease_db.fresh_ids(kcfg.get("stale_after_minutes", 30),
+                              dict(kcfg.get("db") or {}))
+
+
+def reap_evaluate(inst, cfg, ref=None, leased_ids=None, lease_db_down=False) -> dict:
     """Decide one instance's fate.  Pure: no AWS calls, no side effects.
 
     Returns {"action": "reap"|"keep"|"skip", "reason": str, "match": str|None}.
     'skip' means the instance is not even a reap candidate (no prefix match) and
     is reported quietly; 'keep' means it matched a prefix but was spared.
+
+    leased_ids: set of instance_ids with a live keep-alive lease (or None when
+    keepalive is off / not consulted).  lease_db_down: the lease DB could not be
+    read this sweep; combined with keepalive.on_db_error it drives the fail-safe.
     """
     rcfg = cfg["reap"]
     if inst.get("state") != "running":
@@ -711,10 +750,30 @@ def reap_evaluate(inst, cfg, ref=None) -> dict:
         return {"action": "keep",
                 "reason": "age %s < grace %dm" % (fmt_age(age), grace), "match": match}
 
+    kcfg = rcfg.get("keepalive") or {}
+    ka_on = bool(kcfg.get("enabled"))
+    leased = bool(ka_on and leased_ids is not None and inst["id"] in leased_ids)
+
+    # Fail-safe: keepalive is on but the lease DB could not be read this sweep.
+    # We cannot prove a candidate is unleased, and reaping a working box is the
+    # costly mistake, so spare every candidate (configurable via on_db_error).
+    if ka_on and lease_db_down and kcfg.get("on_db_error", "keep") == "keep":
+        return {"action": "keep",
+                "reason": "lease DB unreadable (fail-safe keep)", "match": match}
+
+    # A live lease can optionally override even the hard age cap.
+    if leased and kcfg.get("overrides_max_age"):
+        return {"action": "keep", "reason": "leased (overrides max-age)", "match": match}
+
     max_age_h = rcfg.get("max_age_hours")
     if max_age_h is not None and age >= max_age_h * 3600:
         return {"action": "reap",
                 "reason": "age %s >= max %dh" % (fmt_age(age), max_age_h), "match": match}
+
+    # A live lease spares an otherwise-idle box from idle-reaping -- this is what
+    # ends the "tool reaps a low-CPU-but-active box" fight without a forever tag.
+    if leased:
+        return {"action": "keep", "reason": "leased (fresh heartbeat)", "match": match}
 
     idle_cfg = rcfg.get("idle") or {}
     if idle_cfg.get("enabled", True):
@@ -1087,12 +1146,29 @@ def reap(cfg, session, *, apply=False, no_email=False):
 
     inventory = collect_all(session, cfg, regions)
     ref = now_utc()
+
+    # Keep-alive leases: which boxes have a live heartbeat right now.  A read
+    # failure is turned into the configured fail-safe inside reap_evaluate.
+    kcfg = rcfg.get("keepalive") or {}
+    leased_ids = None
+    lease_db_down = False
+    if kcfg.get("enabled"):
+        try:
+            leased_ids = lease_fresh_ids(kcfg)
+            log.info("keepalive: %d live lease(s)%s", len(leased_ids),
+                     (": " + ", ".join(sorted(leased_ids))) if leased_ids else "")
+        except Exception as exc:  # noqa: BLE001
+            lease_db_down = True
+            log.error("keepalive: lease DB unreadable (%s: %s) -- on_db_error=%s",
+                      type(exc).__name__, exc, kcfg.get("on_db_error", "keep"))
+
     decisions = []
     for inst in inventory["instances"]:
         # One malformed instance must never abort a destructive sweep: on any
         # error we log it and keep the box (fail safe -- it is not terminated).
         try:
-            d = reap_evaluate(inst, cfg, ref)
+            d = reap_evaluate(inst, cfg, ref,
+                              leased_ids=leased_ids, lease_db_down=lease_db_down)
         except Exception as exc:  # noqa: BLE001
             log.error("reap: error evaluating %s [%s]: %s -- keeping it",
                       inst.get("id"), inst.get("region"), exc)

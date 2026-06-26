@@ -117,7 +117,9 @@ python3 aws_watch.py reap --apply
 
 `reap --apply` e-mails you a summary whenever it actually terminates something
 (`reap.email_on_reap`). To exempt one specific box without editing config, tag
-it `Reap=skip` (or add it to `suppress`).
+it `Reap=skip` (or add it to `suppress`) — but prefer a **keep-alive lease**
+(below) for anything temporary: a tag never expires and is exactly how idle boxes
+get left running for days.
 
 > **Tip:** prefer narrow `name_prefixes` and explicit `regions` over `regions:
 > all`. The allowlist makes an all-region sweep safe in principle, but an
@@ -141,7 +143,66 @@ reap:
   protect_tag: "Reap=skip"       # key=value tag that exempts a box ("" => off)
   delete_alarm_template: null    # e.g. "iospharo-idle-terminate-{id}"
   email_on_reap: true
+  keepalive:                     # SELF-EXPIRING protection (see below)
+    enabled: true
+    stale_after_minutes: 30      # heartbeat older than this no longer protects
+    overrides_max_age: false     # the max_age_hours hard cap still wins
+    on_db_error: keep            # DB unreadable => spare everything (fail safe)
+    db: {unix_socket: /run/mysqld/mysqld.sock, user: null, database: aws_watch, table: instance_lease}
 ```
+
+## Keep-alive leases
+
+A protect tag or `suppress` entry exempts a box **forever** — which is precisely
+how a "temporary" box ends up running for days after its work is done. A
+keep-alive lease fixes that by being **self-expiring**: a box is spared only
+while something that wants it keeps actively saying so.
+
+**The contract**
+
+1. **Register** (the creator, once, within the reaper's `min_age_minutes` grace —
+   keep that ≥ 10 min). This just lists the instance id in the `instance_lease`
+   table; it is not yet a heartbeat.
+2. **Heartbeat** — update the row's `last_beat` more often than
+   `stale_after_minutes` (e.g. every < 20 min for the default 30 min window).
+   **Only something actively working should heartbeat**, and when it stops, the
+   lease must be allowed to go stale. In this project the heartbeat is sent
+   **only by an actively-working Claude**, from a Claude Code `PostToolUse` hook
+   ([`aws-lease-beat-hook.sh`](aws-lease-beat-hook.sh)) — no cron, no daemon, no
+   provisioning script ever beats. The instant the Claude finishes, beats stop.
+3. **Release** (teardown) — delete the row. Optional; a released-or-forgotten
+   lease simply goes stale on its own.
+
+The reaper then spares any box with a **fresh** lease from *idle* reaping, and
+reaps a box whose lease is stale or absent exactly like any other orphan. The
+`max_age_hours` hard cap still applies (a stuck heartbeat can't keep a box
+forever) unless you set `overrides_max_age: true`. If the lease DB can't be read,
+`on_db_error: keep` spares everything that sweep (never reap on missing data).
+
+**Set up the table (once)**
+
+```sh
+mysql < schema.sql          # creates DB `aws_watch` + table `instance_lease`
+```
+
+**The writer + the locked-down key.** Writers never touch the DB directly from a
+remote box. They run [`lease_cmd.py`](lease_cmd.py) — `register` / `beat` /
+`release` / `fresh` / `list`, with strict validation and fully-parameterized SQL
+([`lease_db.py`](lease_db.py)). To let a box (or a laptop) heartbeat without
+giving it any other access, expose `lease_cmd.py` as an SSH **forced command** on
+a dedicated key:
+
+```sh
+# on the writer:
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/aws-lease -C aws-lease-beat
+# on this host (~/.ssh/authorized_keys) — this key can do NOTHING else:
+command="/usr/bin/python3 /home/USER/src/aws_watch/lease_cmd.py",restrict ssh-ed25519 AAAA…  aws-lease-beat
+```
+
+Then a heartbeat is just `ssh -i ~/.ssh/aws-lease HOST "beat i-0123…"`; a shell or
+any other command over that key is refused. The reader (`aws_watch reap`) talks
+to the DB locally via `keepalive.db` (unix_socket auth as the cron user by
+default — no password on disk).
 
 ## Requirements
 

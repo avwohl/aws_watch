@@ -67,8 +67,9 @@ suppress: []
 #       1. enabled: true
 #       2. its Name (or Project) tag matches one of `name_prefixes`  <-- allowlist
 #       3. it matches NO protect_* rule, has no protect tag, is not suppressed
-#       4. it is older than `min_age_minutes`
-#       5. it is idle, OR older than `max_age_hours`
+#       4. it has no FRESH keep-alive lease (see `keepalive` below)
+#       5. it is older than `min_age_minutes`
+#       6. it is idle, OR older than `max_age_hours`
 #   * With an EMPTY `name_prefixes`, nothing is ever a candidate -- the reaper
 #     is a no-op.  The allowlist is the primary safety gate: name it narrowly.
 #   * Even fully configured, `aws_watch.py reap` only PREVIEWS.  Termination
@@ -97,7 +98,9 @@ reap:
   regions: []
   #  - us-east-2
 
-  min_age_minutes: 30               # grace: never touch a box younger than this
+  min_age_minutes: 10               # grace: never touch a box younger than this.
+                                    # Keep >= the window a creator needs to REGISTER
+                                    # its keep-alive lease (see keepalive below).
   max_age_hours: 12                 # hard cap: reap at this age regardless of load
                                     # (null => disable age-based reaping; idle only)
   idle:
@@ -113,9 +116,36 @@ reap:
   protect_zones: []                 #  - us-east-2c
   protect_tag: "Reap=skip"          # key=value tag that exempts a box. "Reap"
                                     # (no =value) exempts on key presence. "" disables.
+                                    # PREFER keep-alive leases over a forever-tag:
+                                    # a tag never expires and is how idle boxes get
+                                    # left running for days.  Keep this for rare
+                                    # manual pins only.
 
   # After terminating, optionally delete a per-instance CloudWatch alarm.
   # "{id}" is replaced with the instance id.  null => leave alarms alone.
   delete_alarm_template: null       # e.g. "iospharo-idle-terminate-{id}"
 
   email_on_reap: true               # e-mail a summary whenever boxes are terminated
+
+  # --- Keep-alive leases ----------------------------------------------------
+  # A box with a FRESH lease in the instance_lease table is spared from *idle*
+  # reaping; a stale/absent lease lets the normal idle/age rules apply.  Unlike a
+  # protect tag, a lease SELF-EXPIRES: a creator registers the box, and something
+  # actively-working must keep heartbeating it, so once whatever wanted the box
+  # stops (finishes, crashes, walks away) the lease goes stale and the box is
+  # reaped like any other orphan.  See README "Keep-alive leases" for the writer
+  # side (lease_cmd.py + a locked-down forced-command SSH key) and schema.sql.
+  keepalive:
+    enabled: true                   # false => leases ignored entirely
+    stale_after_minutes: 30         # heartbeat older than this => no longer protected
+    overrides_max_age: false        # false => the max_age_hours hard cap still wins
+    on_db_error: keep               # "keep": fail-safe, spare all | "ignore": reap per normal rules
+    db:                             # MariaDB connection (unix_socket auth by default)
+      unix_socket: /run/mysqld/mysqld.sock
+      host: null                    # set host+port to use TCP instead of the socket
+      port: 3306
+      user: null                    # null => the invoking OS user (unix_socket auth)
+      password: null
+      database: aws_watch
+      table: instance_lease
+      read_default_file: null       # e.g. "~/.my.cnf" (alternative to the above)
