@@ -51,6 +51,11 @@ def _decode_note(tok):
             tok = base64.b64decode(tok[4:], validate=True).decode("utf-8", "replace")
         except Exception:
             tok = ""
+    # Strip C0/C1 control bytes (incl. ESC, CR, LF, TAB) so a crafted note can
+    # never drive terminal escapes or break TSV columns when an operator runs
+    # `lease.sh list`.  The note is the only field that skips TOKEN_RE.
+    tok = "".join(c for c in tok
+                  if 0x20 <= ord(c) <= 0x7e or ord(c) >= 0xa0)
     return tok[:NOTE_MAX]
 
 
@@ -60,7 +65,11 @@ def _check_token(name, val):
     return val or ""
 
 
-def run(argv):
+def run(argv, only=None):
+    # `only` (set by a per-box forced command, see main()) pins this key to a
+    # single instance: every mutating verb must target it, and reads are scoped
+    # to it.  Default (only=None) is the shared-key model -- fine for a single
+    # owner; use per-box keys when leases span mutually-distrusting projects.
     if not argv:
         return _die("no command (verbs: %s)" % ", ".join(sorted(VERBS)))
     verb = argv[0]
@@ -71,6 +80,8 @@ def run(argv):
         if len(argv) < 2 or not IID_RE.match(argv[1]):
             return _die("%s needs a valid instance id (i-...)" % verb)
         iid = argv[1]
+        if only is not None and iid != only:
+            return _die("this key may only %s %s, not %s" % (verb, only, iid))
 
     try:
         if verb == "release":
@@ -94,11 +105,15 @@ def run(argv):
         if verb == "fresh":
             mins = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 30
             ids = sorted(lease_db.fresh_ids(mins))
+            if only is not None:
+                ids = [i for i in ids if i == only]
             print("\n".join(ids) if ids else "(no live leases within %dm)" % mins)
             return 0
 
         if verb == "list":
             rows = lease_db.all_rows()
+            if only is not None:
+                rows = [r for r in rows if r["instance_id"] == only]
             if not rows:
                 print("(no leases)")
                 return 0
@@ -116,6 +131,14 @@ def run(argv):
 
 
 def main():
+    # A per-box forced command pins this key to one instance:
+    #   command="/usr/bin/python3 .../lease_cmd.py --only i-0123…"
+    # `--only` is read from THIS process's argv (set by authorized_keys), never
+    # from the client's SSH_ORIGINAL_COMMAND, so a key holder cannot widen it.
+    local = sys.argv[1:]
+    only = None
+    if len(local) >= 2 and local[0] == "--only":
+        only, local = local[1], local[2:]
     orig = os.environ.get("SSH_ORIGINAL_COMMAND")
     if orig is not None:
         try:
@@ -123,8 +146,8 @@ def main():
         except ValueError:
             return _die("unparseable command")
     else:
-        argv = sys.argv[1:]
-    return run(argv)
+        argv = local
+    return run(argv, only=only)
 
 
 if __name__ == "__main__":

@@ -204,6 +204,26 @@ any other command over that key is refused. The reader (`aws_watch reap`) talks
 to the DB locally via `keepalive.db` (unix_socket auth as the cron user by
 default — no password on disk).
 
+**Trust model & limitations.** By default the forced-command key is *shared* (the
+same key on every box) and `lease_cmd.py` authorizes by instance-id *format*
+only, so any key holder can `beat`/`release` any lease and `list` the registry.
+For a single owner this is fine: a box holding the key can already terminate its
+same-account siblings via its instance-profile IAM, so the lease path grants
+nothing new, and the reaper only ever honors a lease for an instance already on
+`reap.name_prefixes` — a lease cannot protect or resurrect an off-allowlist box.
+If leases span mutually-distrusting projects, issue a **per-box key** and pin its
+instance id in the forced command:
+
+```
+command="/usr/bin/python3 /home/USER/src/aws_watch/lease_cmd.py --only i-0123…",restrict ssh-ed25519 AAAA…
+```
+
+With `--only`, that key may register/beat/release/list only that one instance;
+the pin is read from `authorized_keys`, not the client, so it cannot be widened.
+(Notes also pass a control-character filter, so a crafted note can't inject
+terminal escapes into `list`; and the reaper releases a box's lease row when it
+reaps it, so the table self-prunes.)
+
 ## Requirements
 
 - Python 3.9+

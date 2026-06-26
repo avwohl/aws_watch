@@ -87,7 +87,7 @@ def upsert(instance_id, region="", project="", owner="", note="",
         "  project     = IF(VALUES(project) = '', project, VALUES(project)), "
         "  owner       = IF(VALUES(owner)   = '', owner,   VALUES(owner)), "
         "  note        = IF(VALUES(note)    = '', note,    VALUES(note)), "
-        "  lease_until = VALUES(lease_until)"
+        "  lease_until = IF(VALUES(lease_until) IS NULL, lease_until, VALUES(lease_until))"
     ) % t
     con = connect(cfg)
     try:

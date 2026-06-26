@@ -753,27 +753,32 @@ def reap_evaluate(inst, cfg, ref=None, leased_ids=None, lease_db_down=False) -> 
     kcfg = rcfg.get("keepalive") or {}
     ka_on = bool(kcfg.get("enabled"))
     leased = bool(ka_on and leased_ids is not None and inst["id"] in leased_ids)
+    # Fail OPEN only on an explicit "ignore"; any other value (incl. a typo) is
+    # treated as the safe "keep", so a misconfiguration never biases toward
+    # terminating a possibly-active box.
+    fail_safe_keep = bool(ka_on and lease_db_down and
+                          str(kcfg.get("on_db_error", "keep")).strip().lower() != "ignore")
 
-    # Fail-safe: keepalive is on but the lease DB could not be read this sweep.
-    # We cannot prove a candidate is unleased, and reaping a working box is the
-    # costly mistake, so spare every candidate (configurable via on_db_error).
-    if ka_on and lease_db_down and kcfg.get("on_db_error", "keep") == "keep":
-        return {"action": "keep",
-                "reason": "lease DB unreadable (fail-safe keep)", "match": match}
-
-    # A live lease can optionally override even the hard age cap.
-    if leased and kcfg.get("overrides_max_age"):
-        return {"action": "keep", "reason": "leased (overrides max-age)", "match": match}
-
+    # The hard age cap wins FIRST -- even when the lease DB is unreadable -- so a
+    # box past max_age can never run for days on a DB outage (the exact failure
+    # this whole system exists to prevent). A live lease overrides the cap ONLY
+    # with overrides_max_age, and only when we actually know the box is leased.
     max_age_h = rcfg.get("max_age_hours")
-    if max_age_h is not None and age >= max_age_h * 3600:
+    over_max = max_age_h is not None and age >= max_age_h * 3600
+    if over_max and not (leased and kcfg.get("overrides_max_age")):
         return {"action": "reap",
                 "reason": "age %s >= max %dh" % (fmt_age(age), max_age_h), "match": match}
+    if over_max:
+        return {"action": "keep", "reason": "leased (overrides max-age)", "match": match}
 
-    # A live lease spares an otherwise-idle box from idle-reaping -- this is what
-    # ends the "tool reaps a low-CPU-but-active box" fight without a forever tag.
+    # Below the hard cap: a live lease spares an otherwise-idle box from idle-
+    # reaping -- this is what ends the "tool reaps a low-CPU-but-active box" fight
+    # without a forever tag.  The DB-down fail-safe spares everything else.
     if leased:
         return {"action": "keep", "reason": "leased (fresh heartbeat)", "match": match}
+    if fail_safe_keep:
+        return {"action": "keep",
+                "reason": "lease DB unreadable (fail-safe keep)", "match": match}
 
     idle_cfg = rcfg.get("idle") or {}
     if idle_cfg.get("enabled", True):
@@ -1186,6 +1191,18 @@ def reap(cfg, session, *, apply=False, no_email=False):
             d["outcome"] = "would-reap"
 
     reaped = [d for d in to_reap if d.get("outcome") == "reaped"]
+
+    # GC: release the lease rows of boxes we actually reaped.  The normal
+    # end-of-life (Claude stops -> lease goes stale -> reaped here) bypasses
+    # teardown's release, so prune the now-dead rows to keep the table tidy.
+    if will_terminate and reaped and kcfg.get("enabled") and not lease_db_down:
+        try:
+            import lease_db
+            for d in reaped:
+                lease_db.release(d["inst"]["id"], dict(kcfg.get("db") or {}))
+        except Exception as exc:  # noqa: BLE001 - GC is best-effort, never fatal
+            log.debug("lease GC after reap failed: %s", exc)
+
     summary = "reap: %d %s, %d kept (%d candidate%s matched a prefix), account %s | %s" % (
         len(reaped) if will_terminate else len(to_reap),
         "reaped" if will_terminate else "would-reap",
