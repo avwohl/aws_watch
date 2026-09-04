@@ -297,6 +297,33 @@ else fail "it says how much work is at risk"; fi
 if [ -s "$SCRATCH/notes/wip-"*.diff ]; then pass "wip.diff still written as the fallback"
 else fail "wip.diff still written as the fallback"; fi
 
+echo "== case 12: two preserves running at once do not break each other =="
+# The spot watcher re-preserves every 20s while an interruption notice stands,
+# and the idle timer fires independently -- they CAN overlap.  Sharing a
+# timestamp, both runs used to collide on git's <bundle>.lock and on each
+# other's bundle file: one raised the failure alarm and the other uploaded a
+# dump whose bundle had already been deleted.
+new_world
+echo "work that must survive a collision" > "$SCRATCH/box/wip.txt"
+for i in 1 2; do
+    REPO="$SCRATCH/box" NOTES_DIR="$SCRATCH/notes" WORK_BRANCH=jit \
+        BUCKET=testbucket S3_PREFIX="s3://testbucket/notes" \
+        AWS_CLI="$SCRATCH/bin/aws" FAKE_S3="$SCRATCH/s3" \
+        "$PRESERVE" "concurrent-$i" >"$SCRATCH/race-$i.txt" 2>&1 &
+done
+wait
+if grep -q "BUNDLE FAILED" "$SCRATCH/race-1.txt" "$SCRATCH/race-2.txt"; then
+    fail "neither run raises a false failure alarm"
+else pass "neither run raises a false failure alarm"; fi
+if grep -q "FAILED or was partial" "$SCRATCH/race-1.txt" "$SCRATCH/race-2.txt"; then
+    fail "neither run uploads a partial dump"
+else pass "neither run uploads a partial dump"; fi
+if dump_carries wip.txt; then pass "the dump is intact and unbundles"
+else fail "the dump is intact and unbundles"; fi
+if [ -n "$(git -C "$SCRATCH/box" for-each-ref --format='%(refname)' 'refs/autosave/*')" ]; then
+    fail "no autosave ref left behind by either run"
+else pass "no autosave ref left behind by either run"; fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
     echo "all preserve.sh cases passed"

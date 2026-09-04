@@ -203,10 +203,22 @@ if [ -d "$REPO/.git" ]; then
     dump_commit="${autosaved:-$deliberate}"
     if [ -n "$dump_commit" ]; then
         DUMP_DIR="${AUTOSAVE_PREFIX}/$(box_id)/${ts}"
-        BUNDLE="${AUTOSAVE_BUNDLE_DIR:-${TMPDIR:-/tmp}}/autosave-${ts}.bundle"
+        # The pid is in the FILE name for the same reason it is in the ref:
+        # two preserves can overlap.  Without it they collide on git's
+        # <bundle>.lock, and whichever finishes first `rm -f`s the other's
+        # bundle out from under its upload.  Both runs then fail -- one loudly,
+        # one with a half-written dump.
+        BUNDLE="${AUTOSAVE_BUNDLE_DIR:-${TMPDIR:-/tmp}}/autosave-${ts}.$$.bundle"
         # A bundle needs a ref name, not a raw SHA, and the name travels inside
         # it.  This ref is local to the box and is never pushed anywhere.
-        DUMP_REF="refs/autosave/${ts}"
+        #
+        # The pid is in the name because two preserves CAN overlap: the spot
+        # watcher re-preserves every 20s while an interruption notice stands,
+        # and the idle timer fires independently.  Sharing a ref name, one run
+        # would delete the ref the other was about to bundle -- which now
+        # raises the BUNDLE FAILED alarm below.  An alarm with a known false
+        # positive is one you learn to ignore, so give each run its own ref.
+        DUMP_REF="refs/autosave/${ts}.$$"
         git -c safe.directory="$REPO" update-ref "$DUMP_REF" "$dump_commit"
 
         # --not --remotes=origin makes this a DELTA against what origin already

@@ -107,7 +107,7 @@ preserve and no sign of it: a script not landing, the env file missing a knob
 the scripts read, a unit pointing somewhere the scripts are not, and either unit
 running as the wrong user.
 
-`test-preserve.sh` is ten cases against a throwaway repo, a bare remote and a
+`test-preserve.sh` is twelve cases against a throwaway repo, a bare remote and a
 stub `aws`.
 
     1  nothing to save              branch unmoved, no dump
@@ -123,6 +123,7 @@ stub `aws`.
     10 missing REPO/BUCKET          refused loudly, nothing written
     11 a bundle that FAILS          reported as a failure, never as "nothing
                                     to save", and it says how much is at risk
+    12 two preserves at once        neither breaks the other; the dump is whole
 
 Case 3 is the `ede0fd65` failure reproduced deliberately. Case 9 is the hole the
 branch-based design had: a clean tree meant no snapshot commit, so a box whose
