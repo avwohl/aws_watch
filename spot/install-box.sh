@@ -36,6 +36,15 @@ fi
 : "${REPO:?REPO must be set (the checkout on the box)}"
 : "${BUCKET:?BUCKET must be set (the S3 bucket dumps go to)}"
 
+# spot-watch.service runs as $SPOT_USER.  If that user does not exist the unit
+# fails to start and the box quietly has no interruption watcher at all -- the
+# operator sees a successful provision either way.  Refuse up front instead.
+if ! id "$SPOT_USER" >/dev/null 2>&1; then
+    echo "install-box.sh: user '$SPOT_USER' does not exist on this box." >&2
+    echo "  spot-watch.service would run as it and fail to start." >&2
+    exit 1
+fi
+
 install -d "$PREFIX" "$SYSTEMD_DIR"
 
 # preserve.sh writes its notes, diffs and manifests here, and it runs as
@@ -45,7 +54,11 @@ install -d "$PREFIX" "$SYSTEMD_DIR"
 # write its diff -- the one artifact that needs no git objects to read.
 NOTES_DIR="${NOTES_DIR:-/var/tmp/spot-notes}"
 if [ -z "$SPOT_TEST_ROOT" ]; then
-    install -d -o "$SPOT_USER" -g "$SPOT_USER" -m 755 "$NOTES_DIR"
+    # `chown user:` takes the user's own login group.  Do not assume a group
+    # named after the user exists: on a box where it does not, `install -g`
+    # fails, set -e aborts, and the box is left with no lifecycle at all.
+    install -d -m 755 "$NOTES_DIR"
+    chown "$SPOT_USER:" "$NOTES_DIR"
 else
     install -d -m 755 "${SPOT_TEST_ROOT}${NOTES_DIR}"
 fi
