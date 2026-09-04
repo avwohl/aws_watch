@@ -272,6 +272,31 @@ case "$out" in
 esac
 check "and it wrote nothing" "$(dump_count)" "0"
 
+echo "== case 11: a FAILED bundle is never reported as 'nothing to save' =="
+# `git bundle create` exits non-zero both when there is nothing to bundle and
+# when bundling broke.  Conflating them is how a box two minutes from death
+# tells you its work is safe on origin when nothing was written anywhere.
+new_world
+echo "work that must not be quietly lost" > "$SCRATCH/box/precious.txt"
+RO="$SCRATCH/readonly"; rm -rf "$RO"; mkdir -p "$RO"; chmod 500 "$RO"
+REPO="$SCRATCH/box" NOTES_DIR="$SCRATCH/notes" WORK_BRANCH=jit \
+    BUCKET=testbucket S3_PREFIX="s3://testbucket/notes" \
+    AUTOSAVE_BUNDLE_DIR="$RO" \
+    AWS_CLI="$SCRATCH/bin/aws" FAKE_S3="$SCRATCH/s3" \
+    "$PRESERVE" spot-interruption >"$SCRATCH/out.txt" 2>&1
+chmod 700 "$RO"
+if grep -q "BUNDLE FAILED" "$SCRATCH/out.txt"; then pass "the failure is reported"
+else fail "the failure is reported (got: $(tail -2 "$SCRATCH/out.txt"))"; fi
+if grep -q "nothing to bundle" "$SCRATCH/out.txt"; then
+    fail "it does NOT claim origin already has everything"
+else pass "it does NOT claim origin already has everything"; fi
+if grep -q "commit(s) only on this box" "$SCRATCH/out.txt"; then
+    pass "it says how much work is at risk"
+else fail "it says how much work is at risk"; fi
+# The plain patch is the fallback, and it must still have gone out.
+if [ -s "$SCRATCH/notes/wip-"*.diff ]; then pass "wip.diff still written as the fallback"
+else fail "wip.diff still written as the fallback"; fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
     echo "all preserve.sh cases passed"

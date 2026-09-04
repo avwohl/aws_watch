@@ -203,18 +203,34 @@ if [ -d "$REPO/.git" ]; then
     dump_commit="${autosaved:-$deliberate}"
     if [ -n "$dump_commit" ]; then
         DUMP_DIR="${AUTOSAVE_PREFIX}/$(box_id)/${ts}"
-        BUNDLE="${TMPDIR:-/tmp}/autosave-${ts}.bundle"
+        BUNDLE="${AUTOSAVE_BUNDLE_DIR:-${TMPDIR:-/tmp}}/autosave-${ts}.bundle"
         # A bundle needs a ref name, not a raw SHA, and the name travels inside
         # it.  This ref is local to the box and is never pushed anywhere.
         DUMP_REF="refs/autosave/${ts}"
         git -c safe.directory="$REPO" update-ref "$DUMP_REF" "$dump_commit"
 
         # --not --remotes=origin makes this a DELTA against what origin already
-        # has, so a dump is diff-sized rather than repo-sized, and it exits
-        # non-zero ("Refusing to create empty bundle") precisely when the box
-        # holds nothing origin lacks — which is the "nothing to save" signal.
-        if git -c safe.directory="$REPO" bundle create "$BUNDLE" \
-                "$DUMP_REF" --not --remotes=origin 2>/dev/null; then
+        # has, so a dump is diff-sized rather than repo-sized.
+        #
+        # ASK "IS THERE ANYTHING TO SAVE" SEPARATELY FROM "DID SAVING WORK".
+        # `bundle create` exits non-zero both when there is nothing to bundle
+        # ("Refusing to create empty bundle") and when bundling FAILED -- no
+        # space in the bundle directory, a permission problem, an unreadable
+        # object.  Treating those alike is how a box two minutes from death
+        # reports "origin already has everything" when in fact nothing was
+        # written anywhere.  A disaster-recovery path must never say the work
+        # is safe when it has not looked.
+        n_new=$(git -c safe.directory="$REPO" rev-list --count \
+                    "$DUMP_REF" --not --remotes=origin 2>/dev/null || echo 0)
+        bundle_err=""
+        bundle_ok=0
+        if [ "${n_new:-0}" -gt 0 ]; then
+            if bundle_err=$(git -c safe.directory="$REPO" bundle create "$BUNDLE" \
+                    "$DUMP_REF" --not --remotes=origin 2>&1); then
+                bundle_ok=1
+            fi
+        fi
+        if [ "$bundle_ok" = 1 ]; then
             {
                 echo "instance      $(box_id)"
                 echo "host          $(hostname)"
@@ -247,9 +263,18 @@ if [ -d "$REPO/.git" ]; then
                 echo "preserve: autosave upload to ${DUMP_DIR} FAILED or was partial" \
                     | tee -a "$NOTES_DIR/preserve.log" >&2
             fi
-        else
+        elif [ "${n_new:-0}" -eq 0 ]; then
             echo "preserve: nothing to bundle (origin already has everything)" \
                 >>"$NOTES_DIR/preserve.log"
+        else
+            # ${n_new} commits exist only on this box and we could not package
+            # them.  Say so as loudly as possible: this is work about to be
+            # lost, not a quiet no-op.
+            {
+                echo "preserve: BUNDLE FAILED with ${n_new} commit(s) only on this box"
+                echo "preserve: ${bundle_err}"
+                echo "preserve: the uncommitted half is still going to S3 as wip.diff"
+            } | tee -a "$NOTES_DIR/preserve.log" >&2
         fi
         # The ref would otherwise accumulate one entry per preserve, and a box
         # that is preserved but not reclaimed gets preserved again and again.

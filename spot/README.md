@@ -121,10 +121,15 @@ stub `aws`.
     8  no git ref left behind       on the remote or on the box
     9  a REFUSED push               its commits still reach the dump
     10 missing REPO/BUCKET          refused loudly, nothing written
+    11 a bundle that FAILS          reported as a failure, never as "nothing
+                                    to save", and it says how much is at risk
 
 Case 3 is the `ede0fd65` failure reproduced deliberately. Case 9 is the hole the
 branch-based design had: a clean tree meant no snapshot commit, so a box whose
-push was rejected saved nothing anywhere.
+push was rejected saved nothing anywhere. Case 11 covers the other way a
+recovery path can lie to you: `git bundle create` exits non-zero both when there
+is nothing to bundle and when bundling *broke*, so treating those alike would
+have a box two minutes from death report that origin already had everything.
 
 ## Two things that bite
 

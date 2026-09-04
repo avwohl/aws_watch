@@ -37,6 +37,18 @@ fi
 : "${BUCKET:?BUCKET must be set (the S3 bucket dumps go to)}"
 
 install -d "$PREFIX" "$SYSTEMD_DIR"
+
+# preserve.sh writes its notes, diffs and manifests here, and it runs as
+# $SPOT_USER (the spot watcher's unit user, and the user idle-shutdown drops
+# to).  Create it owned by that user NOW: if it is ever created by a root-run
+# preserve instead, every later preserve as the box user silently fails to
+# write its diff -- the one artifact that needs no git objects to read.
+NOTES_DIR="${NOTES_DIR:-/var/tmp/spot-notes}"
+if [ -z "$SPOT_TEST_ROOT" ]; then
+    install -d -o "$SPOT_USER" -g "$SPOT_USER" -m 755 "$NOTES_DIR"
+else
+    install -d -m 755 "${SPOT_TEST_ROOT}${NOTES_DIR}"
+fi
 install -m755 "$HERE/preserve.sh" "$HERE/spot-watch.sh" "$HERE/idle-shutdown.sh" \
     "$PREFIX/"
 

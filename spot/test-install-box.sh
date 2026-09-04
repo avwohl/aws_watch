@@ -39,6 +39,13 @@ for f in preserve.sh spot-watch.sh idle-shutdown.sh; do
     else fail "$f installed and executable"; fi
 done
 
+echo "== the notes dir exists and is not root-only =="
+# If a root-run preserve creates this first, later preserves as the box user
+# cannot write their wip.diff -- the fallback that needs no git objects.
+if [ -d "$SCRATCH/var/tmp/spot-notes" ]; then pass "notes dir created at install time"
+else fail "notes dir created at install time"; fi
+has "$P/env" "NOTES_DIR=/var/tmp/spot-notes" "NOTES_DIR recorded in the env"
+
 echo "== the env file carries what the scripts actually read =="
 has "$P/env" "REPO=/home/builder/src/proj"            "REPO"
 has "$P/env" "BUCKET=proj-bucket"                     "BUCKET"
