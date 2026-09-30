@@ -1,0 +1,192 @@
+# Reaper and Keep-alive Leases
+
+Back to the [README](../README.md).
+
+## Reaping orphaned instances (optional, ⚠️ DESTRUCTIVE)
+
+> **⚠️ THIS TERMINATES EC2 INSTANCES.** It is the only part of aws_watch that
+> deletes anything. It is **off by default**, runs as a **separate `reap`
+> command** (the hourly watcher never terminates anything), and **previews by
+> default** — it only destroys when you add `--apply`. Read this whole section
+> before enabling it. A careless allowlist or a missing protect rule can delete
+> production. When unsure, leave it disabled.
+
+Automated build/CI flows sometimes launch a throwaway EC2 box and then crash or
+get killed before deleting it, leaving it to run (and bill) forever. The reaper
+sweeps for exactly those orphans and terminates them — **while refusing to touch
+anything that isn't on an explicit allowlist.**
+
+### The safety model
+
+An instance is terminated **only when every one of these is true**:
+
+1. `reap.enabled: true` in `config.yaml`.
+2. Its **`Name` (or `Project`) tag matches one of `reap.name_prefixes`** — the
+   allowlist. With an empty list, **nothing is ever a candidate** and the reaper
+   is a no-op. This is the primary gate: keep it narrow (e.g. `iospharo-*`).
+   Matching is **case-sensitive** (`Iospharo-*` will not match `iospharo-…`), and
+   a bare `*` matches *everything* — never use one; the reaper warns if you do.
+3. It matches **none** of the protect rules — `protect_ids`,
+   `protect_name_globs`, `protect_regions`, `protect_zones`, the `protect_tag`
+   (default `Reap=skip`) — **and is not in your `suppress` list.** Any single
+   match spares it, even if it looks idle and old.
+4. It is older than `min_age_minutes` (grace — never reap a box still booting).
+5. It is **idle** (low load/CPU, measured exactly like the idle *alert*) **or**
+   older than `max_age_hours` (a hard cap).
+
+And even with all of that, **`aws_watch.py reap` only prints what it would do.**
+Termination requires `aws_watch.py reap --apply`. The `--apply` is itself refused
+unless `reap.enabled` is true *and* `reap.name_prefixes` is non-empty, so a
+default or half-configured install can never delete anything.
+
+A box with no load/CPU metric at all, or an undeterminable launch time, is
+**kept** — the reaper never acts on missing data.
+
+### How to use it safely
+
+```sh
+# 1. Configure the allowlist + protections in config.yaml (see config.example.yaml).
+# 2. PREVIEW — terminates nothing, shows the REAP and KEPT tables:
+python3 aws_watch.py reap
+
+# 3. Read both tables carefully. Confirm everything under REAP is genuinely
+#    disposable and nothing production is missing from KEPT.
+# 4. Only then, terminate for real:
+python3 aws_watch.py reap --apply
+
+# 5. Install it on a 15-minute cron (also retires any old reaper cron line):
+./install.sh --with-reaper
+```
+
+`reap --apply` e-mails you a summary whenever it actually terminates something
+(`reap.email_on_reap`). To exempt one specific box without editing config, tag
+it `Reap=skip` (or add it to `suppress`) — but prefer a **keep-alive lease**
+(below) for anything temporary: a tag never expires and is exactly how idle boxes
+get left running for days.
+
+> **Tip:** prefer narrow `name_prefixes` and explicit `regions` over `regions:
+> all`. The allowlist makes an all-region sweep safe in principle, but an
+> explicit region list is one less way to be surprised.
+
+### Reaper configuration (`config.yaml`)
+
+```yaml
+reap:
+  enabled: false                 # master switch
+  name_prefixes: ["iospharo-*"]  # ALLOWLIST — only these can ever be reaped
+  match_tag_keys: [Name, Project]
+  regions: [us-east-2]           # [] => use the top-level `regions`
+  min_age_minutes: 30            # grace period
+  max_age_hours: 12              # hard age cap (null => idle-only)
+  idle: {enabled: true, load_per_vcpu: 0.10, cpu_percent: 5.0}
+  protect_ids: []                # never-reap instance ids
+  protect_name_globs: []         # never-reap Name globs, e.g. "*-prod-*"
+  protect_regions: []
+  protect_zones: []
+  protect_tag: "Reap=skip"       # key=value tag that exempts a box ("" => off)
+  delete_alarm_template: null    # e.g. "iospharo-idle-terminate-{id}"
+  email_on_reap: true
+  keepalive:                     # SELF-EXPIRING protection (see below)
+    enabled: true
+    stale_after_minutes: 30      # heartbeat older than this no longer protects
+    overrides_max_age: false     # the max_age_hours hard cap still wins
+    on_db_error: keep            # DB unreadable => spare everything (fail safe)
+    db: {unix_socket: /run/mysqld/mysqld.sock, user: null, database: aws_watch, table: instance_lease}
+```
+
+## Keep-alive leases
+
+A protect tag or `suppress` entry exempts a box **forever** — which is precisely
+how a "temporary" box ends up running for days after its work is done. A
+keep-alive lease fixes that by being **self-expiring**: a box is spared only
+while something that wants it keeps actively saying so.
+
+**The contract**
+
+1. **Register** (the creator, once, within the reaper's `min_age_minutes` grace —
+   keep that ≥ 10 min). This just lists the instance id in the `instance_lease`
+   table; it is not yet a heartbeat.
+2. **Heartbeat** — update the row's `last_beat` more often than
+   `stale_after_minutes` (e.g. every < 20 min for the default 30 min window).
+   **Only something actively working should heartbeat**, and when it stops, the
+   lease must be allowed to go stale. In this project the heartbeat is sent
+   **only by an actively-working Claude**, from a Claude Code `PostToolUse` hook
+   ([`aws-lease-beat-hook.sh`](../aws-lease-beat-hook.sh)) — no cron, no daemon, no
+   provisioning script ever beats. The instant the Claude finishes, beats stop.
+3. **Release** (teardown) — delete the row. Optional; a released-or-forgotten
+   lease simply goes stale on its own.
+
+The reaper then spares any box with a **fresh** lease from *idle* reaping, and
+reaps a box whose lease is stale or absent exactly like any other orphan. The
+`max_age_hours` hard cap still applies (a stuck heartbeat can't keep a box
+forever) unless you set `overrides_max_age: true`. If the lease DB can't be read,
+`on_db_error: keep` spares everything that sweep (never reap on missing data).
+
+**Set up the table (once)**
+
+```sh
+mysql < schema.sql          # creates DB `aws_watch` + table `instance_lease`
+```
+
+**The writer + the locked-down key.** Writers never touch the DB directly from a
+remote box. They run [`lease_cmd.py`](../lease_cmd.py) — `register` / `beat` /
+`release` / `fresh` / `list`, with strict validation and fully-parameterized SQL
+([`lease_db.py`](../lease_db.py)). To let a box (or a laptop) heartbeat without
+giving it any other access, expose `lease_cmd.py` as an SSH **forced command** on
+a dedicated key:
+
+```sh
+# on the writer:
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/aws-lease -C aws-lease-beat
+# on this host (~/.ssh/authorized_keys) — this key can do NOTHING else:
+command="/usr/bin/python3 /home/USER/src/aws_watch/lease_cmd.py",restrict ssh-ed25519 AAAA…  aws-lease-beat
+```
+
+Then a heartbeat is just `ssh -i ~/.ssh/aws-lease HOST "beat i-0123…"`; a shell or
+any other command over that key is refused. The reader (`aws_watch reap`) talks
+to the DB locally via `keepalive.db` (unix_socket auth as the cron user by
+default — no password on disk).
+
+**Trust model & limitations.** By default the forced-command key is *shared* (the
+same key on every box) and `lease_cmd.py` authorizes by instance-id *format*
+only, so any key holder can `beat`/`release` any lease and `list` the registry.
+For a single owner this is fine: a box holding the key can already terminate its
+same-account siblings via its instance-profile IAM, so the lease path grants
+nothing new, and the reaper only ever honors a lease for an instance already on
+`reap.name_prefixes` — a lease cannot protect or resurrect an off-allowlist box.
+If leases span mutually-distrusting projects, issue a **per-box key** and pin its
+instance id in the forced command:
+
+```
+command="/usr/bin/python3 /home/USER/src/aws_watch/lease_cmd.py --only i-0123…",restrict ssh-ed25519 AAAA…
+```
+
+With `--only`, that key may register/beat/release/list only that one instance;
+the pin is read from `authorized_keys`, not the client, so it cannot be widened.
+(Notes also pass a control-character filter, so a crafted note can't inject
+terminal escapes into `list`; and the reaper releases a box's lease row when it
+reaps it, so the table self-prunes.)
+
+### Extra permissions for the reaper (only if you enable it)
+
+The read-only policy in [setup.md](setup.md#iam-policy-least-privilege-read-only) is enough for the watcher. The **reaper** additionally
+needs the power to terminate instances (and, optionally, delete the per-instance
+idle alarm). This is a privileged grant — add it only if you use `reap`, and
+prefer a separate credential scoped to the regions/resources you actually reap:
+
+```json
+{
+  "Sid": "Reaper",
+  "Effect": "Allow",
+  "Action": [
+    "ec2:TerminateInstances",
+    "cloudwatch:DeleteAlarms"
+  ],
+  "Resource": "*"
+}
+```
+
+Drop the `cloudwatch:DeleteAlarms` action if you leave `reap.delete_alarm_template`
+unset. You can tighten `Resource`/add `Condition` keys (e.g. a tag condition that
+mirrors your `name_prefixes`) for defense in depth.
+

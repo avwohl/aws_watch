@@ -98,7 +98,7 @@ CONFIG_DEFAULTS = {
     },
     "suppress": [],                         # resource ids or "name:<glob>" excluded from alerts
     # --- Reaper (DESTRUCTIVE): terminate orphaned temporary instances. ------- #
-    # OFF by default.  Read the README warnings before enabling.  An instance is
+    # OFF by default.  Read docs/reaper.md warnings first.  An instance is
     # terminated only when ALL of these hold:
     #   1. reap.enabled is true              4. it is older than min_age_minutes
     #   2. its Name/Project tag matches      5. it is idle, OR older than
@@ -125,7 +125,7 @@ CONFIG_DEFAULTS = {
         "protect_tag": "Reap=skip",         # key=value tag that exempts a box ("" => off)
         "delete_alarm_template": None,      # e.g. "iospharo-idle-terminate-{id}" (null => none)
         "email_on_reap": True,              # e-mail a summary when boxes are terminated
-        # --- Keep-alive leases (see README "Keep-alive leases") ---------------- #
+        # --- Keep-alive leases (see docs/reaper.md "Keep-alive leases") ---------------- #
         # A box with a FRESH lease in the instance_lease table is spared from
         # *idle* reaping; a stale/absent lease lets the normal idle/age rules act.
         # Only an actively-working process heartbeats the lease (for iospharo, a

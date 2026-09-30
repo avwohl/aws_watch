@@ -133,7 +133,7 @@ reap:
   # protect tag, a lease SELF-EXPIRES: a creator registers the box, and something
   # actively-working must keep heartbeating it, so once whatever wanted the box
   # stops (finishes, crashes, walks away) the lease goes stale and the box is
-  # reaped like any other orphan.  See README "Keep-alive leases" for the writer
+  # reaped like any other orphan.  See docs/reaper.md "Keep-alive leases" for the writer
   # side (lease_cmd.py + a locked-down forced-command SSH key) and schema.sql.
   keepalive:
     enabled: true                   # false => leases ignored entirely
